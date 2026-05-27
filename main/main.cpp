@@ -27,7 +27,12 @@ static const char *TAG = "main";
 static Motor       *s_motor         = nullptr;
 static CurrentSense *s_current_sense = nullptr;
 
-constexpr int POLE_PAIRS = 7;
+// Pole-pair count used only for the electrical→mechanical RPM conversion in
+// the status readout — drive control is entirely electrical, so this just
+// scales the reported velocity_rpm_mech. Settable via POST /motor
+// {"pole_pairs":N}, persisted in NVS.
+constexpr int DEFAULT_POLE_PAIRS = 7;
+static int s_pole_pairs = DEFAULT_POLE_PAIRS;
 
 // V/Hz defaults applied at boot if NVS doesn't already have values stored.
 // v_offset is intentionally conservative — small enough that, even without
@@ -51,7 +56,7 @@ constexpr float DEFAULT_PUMP_MAX_RAD_S = 1000.0f;
 constexpr float PUMP_OFF_DUTY_PCT = 0.5f;
 
 static inline float elec_to_mech_rpm(float elec_rad_s) {
-    return elec_rad_s * 60.0f / (2.0f * std::numbers::pi_v<float> * static_cast<float>(POLE_PAIRS));
+    return elec_rad_s * 60.0f / (2.0f * std::numbers::pi_v<float> * static_cast<float>(s_pole_pairs));
 }
 
 static SemaphoreHandle_t s_wifi_got_ip;
@@ -119,6 +124,7 @@ static void motor_status_to_json(JsonWrapper &json) {
     json.AddItem("velocity_rad_s",         st.target_velocity_rad_s);
     json.AddItem("current_velocity_rad_s", st.current_velocity_rad_s);
     json.AddItem("velocity_rpm_mech",      elec_to_mech_rpm(st.current_velocity_rad_s));
+    json.AddItem("pole_pairs",             s_pole_pairs);
     json.AddItem("voltage_v",              st.voltage_amplitude_v);
     json.AddItem("v_offset_v",             st.v_offset_v);
     json.AddItem("v_per_rad_s",            st.v_per_rad_s);
@@ -152,6 +158,14 @@ static bool parse_float(const std::string &s, float &out) {
     float v = std::strtof(s.c_str(), &end);
     if (end == s.c_str()) return false;
     out = v;
+    return true;
+}
+
+static bool parse_int(const std::string &s, int &out) {
+    char *end = nullptr;
+    long v = std::strtol(s.c_str(), &end, 10);
+    if (end == s.c_str()) return false;
+    out = static_cast<int>(v);
     return true;
 }
 
@@ -226,6 +240,18 @@ static void load_pump_range_from_nvs_or_defaults(float &min_v, float &max_v) {
     std::string s;
     if (s_nvs->retrieve("pump_min", s) && !s.empty()) parse_float(s, min_v);
     if (s_nvs->retrieve("pump_max", s) && !s.empty()) parse_float(s, max_v);
+}
+
+static bool save_pole_pairs_to_nvs(int pole_pairs) {
+    if (!s_nvs) return false;
+    return s_nvs->store("pole_pairs", std::to_string(pole_pairs));
+}
+
+static void load_pole_pairs_from_nvs_or_default(int &pole_pairs) {
+    pole_pairs = DEFAULT_POLE_PAIRS;
+    if (!s_nvs) return;
+    std::string s;
+    if (s_nvs->retrieve("pole_pairs", s) && !s.empty()) parse_int(s, pole_pairs);
 }
 
 class MotorWebServer : public WebServer {
@@ -324,6 +350,14 @@ private:
         if (json.GetField("stall_current_a", v)) {
             s_motor->set_stall_current_a(v);
             tuning_changed = true;
+        }
+        // pole_pairs only scales the RPM readout; persist it on its own NVS key
+        // (independent of the V/Hz tuning group) so it survives a reboot.
+        int pp;
+        if (json.GetField("pole_pairs", pp)) {
+            if (pp < 1) pp = 1;
+            s_pole_pairs = pp;
+            save_pole_pairs_to_nvs(pp);
         }
         bool enabled;
         if (json.GetField("enabled", enabled)) {
@@ -538,6 +572,9 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "pump range loaded: duty 0-100%% -> %.1f..%.1f rad/s",
         static_cast<double>(s_pump_min_rad_s), static_cast<double>(s_pump_max_rad_s));
 
+    load_pole_pairs_from_nvs_or_default(s_pole_pairs);
+    ESP_LOGI(TAG, "pole pairs loaded: %d (RPM display only)", s_pole_pairs);
+
     static WiFiManager wifi(nv, wifi_event_handler, nullptr);
     ESP_LOGI(TAG, "wifi manager started; if unprovisioned, use ESP-Touch v2 app");
 
@@ -558,7 +595,7 @@ extern "C" void app_main(void) {
     static MotorWebServer web(&web_ctx);
     ESP_ERROR_CHECK(web.start());
     ESP_LOGI(TAG, "webserver up: POST /motor {\"velocity_rad_s\":N,\"voltage_v\":N,"
-                  "\"v_per_rad_s\":N,\"stall_current_a\":N,\"enabled\":bool}, "
+                  "\"v_per_rad_s\":N,\"stall_current_a\":N,\"pole_pairs\":N,\"enabled\":bool}, "
                   "GET /motor for status, POST/GET /calibrate for motor identification, "
                   "POST /pump {\"duty\":0-100}, POST/GET /pump_range "
                   "{\"min_rad_s\":N,\"max_rad_s\":N}");
