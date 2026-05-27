@@ -7,6 +7,9 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include <cstdlib>
+#include <numbers>
+#include <optional>
 #include <string>
 
 #include "JsonWrapper.h"
@@ -19,7 +22,12 @@
 
 static const char *TAG = "main";
 
-#define POLE_PAIRS           7
+// Set once at the top of app_main; the static HTTP handlers reach the drive
+// and sensor instances through these.
+static Motor       *s_motor         = nullptr;
+static CurrentSense *s_current_sense = nullptr;
+
+constexpr int POLE_PAIRS = 7;
 
 // V/Hz defaults applied at boot if NVS doesn't already have values stored.
 // v_offset is intentionally conservative — small enough that, even without
@@ -27,23 +35,23 @@ static const char *TAG = "main";
 // motor's rating for typical low-resistance motors. Tune upward via POST
 // /motor {"voltage_v":...} if the motor doesn't start; the value persists
 // in NVS. v_per_rad_s should track the motor's back-EMF constant Ke.
-#define DEFAULT_V_OFFSET_V      0.10f
-#define DEFAULT_V_PER_RAD_S     0.001f
+constexpr float DEFAULT_V_OFFSET_V  = 0.10f;
+constexpr float DEFAULT_V_PER_RAD_S = 0.001f;
 
 // Pump-control mapping: stillerate's PID POSTs a 0–100 % "duty" to /pump.
 // duty 0 → motor stopped; duty>0 → enabled and linearly mapped onto
 // [pump_min, pump_max] rad/s. The range is settable via POST /pump_range and
 // persists in NVS. Min is the lowest speed the V/Hz drive runs smoothly at, so
 // even a small positive duty produces a clean spin rather than a stall.
-#define DEFAULT_PUMP_MIN_RAD_S  50.0f
-#define DEFAULT_PUMP_MAX_RAD_S  1000.0f
+constexpr float DEFAULT_PUMP_MIN_RAD_S = 50.0f;
+constexpr float DEFAULT_PUMP_MAX_RAD_S = 1000.0f;
 
 // Duty below this (percent) is treated as "off" — gives a small deadband so
 // PID output hovering near zero doesn't chatter the bridge enable.
-#define PUMP_OFF_DUTY_PCT       0.5f
+constexpr float PUMP_OFF_DUTY_PCT = 0.5f;
 
 static inline float elec_to_mech_rpm(float elec_rad_s) {
-    return elec_rad_s * 60.0f / (2.0f * 3.14159265f * (float)POLE_PAIRS);
+    return elec_rad_s * 60.0f / (2.0f * std::numbers::pi_v<float> * static_cast<float>(POLE_PAIRS));
 }
 
 static SemaphoreHandle_t s_wifi_got_ip;
@@ -87,7 +95,7 @@ static void wifi_diag_handler(void *arg, esp_event_base_t base,
             ESP_LOGI(TAG, "WIFI_EVENT_SCAN_DONE");
             break;
         default:
-            ESP_LOGI(TAG, "WIFI_EVENT id=%ld", (long)id);
+            ESP_LOGI(TAG, "WIFI_EVENT id=%ld", static_cast<long>(id));
             break;
     }
 }
@@ -98,7 +106,7 @@ static std::string read_request_body(httpd_req_t *req) {
     char buf[256];
     int remaining = req->content_len;
     while (remaining > 0) {
-        int got = httpd_req_recv(req, buf, std::min<int>(remaining, (int)sizeof(buf)));
+        int got = httpd_req_recv(req, buf, std::min<int>(remaining, static_cast<int>(sizeof(buf))));
         if (got <= 0) break;
         body.append(buf, got);
         remaining -= got;
@@ -107,8 +115,7 @@ static std::string read_request_body(httpd_req_t *req) {
 }
 
 static void motor_status_to_json(JsonWrapper &json) {
-    motor_status_t st;
-    motor_get_status(&st);
+    Motor::Status st = s_motor->status();
     json.AddItem("velocity_rad_s",         st.target_velocity_rad_s);
     json.AddItem("current_velocity_rad_s", st.current_velocity_rad_s);
     json.AddItem("velocity_rpm_mech",      elec_to_mech_rpm(st.current_velocity_rad_s));
@@ -120,17 +127,16 @@ static void motor_status_to_json(JsonWrapper &json) {
     json.AddItem("stall_current_a",        st.stall_current_a);
     json.AddItem("enabled",                st.enabled);
     json.AddItem("stalled",                st.stalled);
-    json.AddItem("uptime_s",               (int)st.uptime_s);
+    json.AddItem("uptime_s",               static_cast<int>(st.uptime_s));
 
     // Raw phase current snapshot — useful for debugging bias drift.
-    float ia, ib, ic;
-    current_sense_read(&ia, &ib, &ic);
-    json.AddItem("ia_a", ia);
-    json.AddItem("ib_a", ib);
-    json.AddItem("ic_a", ic);
+    CurrentSense::Phases ph = s_current_sense->read();
+    json.AddItem("ia_a", ph.ia);
+    json.AddItem("ib_a", ph.ib);
+    json.AddItem("ic_a", ph.ic);
 }
 
-static void cal_to_json(const motor_cal_t &cal, JsonWrapper &json) {
+static void cal_to_json(const Motor::Cal &cal, JsonWrapper &json) {
     json.AddItem("valid", cal.valid);
     if (cal.valid) {
         json.AddItem("rs_ohm",   cal.rs_ohm);
@@ -143,13 +149,13 @@ static NvsStorageManager *s_nvs = nullptr;
 
 static bool parse_float(const std::string &s, float &out) {
     char *end = nullptr;
-    float v = strtof(s.c_str(), &end);
+    float v = std::strtof(s.c_str(), &end);
     if (end == s.c_str()) return false;
     out = v;
     return true;
 }
 
-static bool save_cal_to_nvs(const motor_cal_t &cal) {
+static bool save_cal_to_nvs(const Motor::Cal &cal) {
     if (!s_nvs) return false;
     bool ok = true;
     ok &= s_nvs->store("rs_ohm",   std::to_string(cal.rs_ohm));
@@ -158,7 +164,7 @@ static bool save_cal_to_nvs(const motor_cal_t &cal) {
     return ok;
 }
 
-static bool load_cal_from_nvs(motor_cal_t &cal) {
+static bool load_cal_from_nvs(Motor::Cal &cal) {
     if (!s_nvs) return false;
     std::string rs_s, ls_s, vd_s;
     if (!s_nvs->retrieve("rs_ohm",   rs_s) || rs_s.empty()) return false;
@@ -185,7 +191,7 @@ static bool save_vhz_to_nvs(float v_offset, float v_per_rad_s, float stall_a) {
 static void load_vhz_from_nvs_or_defaults(float &v_offset, float &v_per_rad_s, float &stall_a) {
     v_offset    = DEFAULT_V_OFFSET_V;
     v_per_rad_s = DEFAULT_V_PER_RAD_S;
-    stall_a     = 3.0f;   // mirrors DEFAULT_STALL_CURRENT_A in motor.c
+    stall_a     = Motor::kDefaultStallCurrentA;
     if (!s_nvs) return;
     std::string s;
     if (s_nvs->retrieve("v_offset",   s) && !s.empty()) parse_float(s, v_offset);
@@ -305,30 +311,29 @@ private:
         float v;
         bool tuning_changed = false;
         if (json.GetField("velocity_rad_s", v)) {
-            motor_set_velocity(v);
+            s_motor->set_velocity(v);
         }
         if (json.GetField("voltage_v", v)) {
-            motor_set_voltage_amplitude(v);
+            s_motor->set_voltage_amplitude(v);
             tuning_changed = true;
         }
         if (json.GetField("v_per_rad_s", v)) {
-            motor_set_v_per_rad_s(v);
+            s_motor->set_v_per_rad_s(v);
             tuning_changed = true;
         }
         if (json.GetField("stall_current_a", v)) {
-            motor_set_stall_current_a(v);
+            s_motor->set_stall_current_a(v);
             tuning_changed = true;
         }
         bool enabled;
         if (json.GetField("enabled", enabled)) {
-            if (enabled) motor_enable();
-            else         motor_disable();
+            if (enabled) s_motor->enable();
+            else         s_motor->disable();
         }
 
         // Persist tuning whenever it changes so settings survive a reboot.
         if (tuning_changed) {
-            motor_status_t st;
-            motor_get_status(&st);
+            Motor::Status st = s_motor->status();
             save_vhz_to_nvs(st.v_offset_v, st.v_per_rad_s, st.stall_current_a);
         }
 
@@ -350,17 +355,16 @@ private:
     }
 
     static esp_err_t calibrate_post_handler(httpd_req_t *req) {
-        motor_status_t st;
-        motor_get_status(&st);
+        Motor::Status st = s_motor->status();
         if (st.enabled) {
             return sendJsonError(req, 409, "motor must be disabled before /calibrate");
         }
 
-        motor_cal_t cal;
-        esp_err_t r = motor_identify(&cal);
-        if (r != ESP_OK) {
+        std::optional<Motor::Cal> cal_opt = s_motor->identify();
+        if (!cal_opt) {
             return sendJsonError(req, 500, "identification failed — check device log");
         }
+        const Motor::Cal &cal = *cal_opt;
 
         if (!save_cal_to_nvs(cal)) {
             ESP_LOGW(TAG, "cal applied to runtime but NVS save failed");
@@ -375,8 +379,7 @@ private:
     }
 
     static esp_err_t calibrate_get_handler(httpd_req_t *req) {
-        motor_cal_t cal;
-        motor_get_cal(&cal);
+        Motor::Cal cal = s_motor->cal();
         JsonWrapper resp;
         cal_to_json(cal, resp);
         httpd_resp_set_type(req, "application/json");
@@ -411,24 +414,23 @@ private:
         std::string name;
         json.GetField("name", name);   // optional, informational
 
-        motor_status_t st;
-        motor_get_status(&st);
+        Motor::Status st = s_motor->status();
 
         float velocity = 0.0f;
         bool enabled;
         if (duty <= PUMP_OFF_DUTY_PCT) {
-            if (st.enabled) motor_disable();
+            if (st.enabled) s_motor->disable();
             enabled = false;
         } else {
             velocity = pump_duty_to_velocity(duty);
-            motor_set_velocity(velocity);
-            if (!st.enabled) motor_enable();
+            s_motor->set_velocity(velocity);
+            if (!st.enabled) s_motor->enable();
             enabled = true;
         }
 
         JsonWrapper resp;
         resp.AddItem("status",         std::string("success"));
-        resp.AddItem("received_duty",  (int)(duty + 0.5f));
+        resp.AddItem("received_duty",  static_cast<int>(duty + 0.5f));
         resp.AddItem("velocity_rad_s", velocity);
         resp.AddItem("enabled",        enabled);
         httpd_resp_set_type(req, "application/json");
@@ -489,9 +491,14 @@ private:
 };
 
 extern "C" void app_main(void) {
-    ESP_ERROR_CHECK(motor_init());
-    ESP_ERROR_CHECK(current_sense_init());
-    ESP_ERROR_CHECK(current_sense_calibrate_bias());
+    static CurrentSense current_sense;
+    static Motor motor(current_sense);
+    s_current_sense = &current_sense;
+    s_motor = &motor;
+
+    ESP_ERROR_CHECK(motor.init());
+    ESP_ERROR_CHECK(current_sense.init());
+    ESP_ERROR_CHECK(current_sense.calibrate_bias());
 
     s_wifi_got_ip = xSemaphoreCreateBinary();
 
@@ -506,11 +513,12 @@ extern "C" void app_main(void) {
     }
 
     {
-        motor_cal_t cal;
+        Motor::Cal cal;
         if (load_cal_from_nvs(cal)) {
-            motor_set_cal(&cal);
+            motor.set_cal(cal);
             ESP_LOGI(TAG, "motor cal loaded from NVS: Rs=%.4f Ω, Ls=%.6f H, V_dead=%.4f V",
-                (double)cal.rs_ohm, (double)cal.ls_henry, (double)cal.v_dead);
+                static_cast<double>(cal.rs_ohm), static_cast<double>(cal.ls_henry),
+                static_cast<double>(cal.v_dead));
         } else {
             ESP_LOGW(TAG, "no motor cal in NVS — POST /calibrate to identify");
         }
@@ -519,16 +527,16 @@ extern "C" void app_main(void) {
     {
         float v_offset, v_per, stall_a;
         load_vhz_from_nvs_or_defaults(v_offset, v_per, stall_a);
-        motor_set_voltage_amplitude(v_offset);
-        motor_set_v_per_rad_s(v_per);
-        motor_set_stall_current_a(stall_a);
+        motor.set_voltage_amplitude(v_offset);
+        motor.set_v_per_rad_s(v_per);
+        motor.set_stall_current_a(stall_a);
         ESP_LOGI(TAG, "tuning loaded: v_offset=%.4f V, v_per_rad_s=%.6f V·s/rad, stall=%.2f A",
-            (double)v_offset, (double)v_per, (double)stall_a);
+            static_cast<double>(v_offset), static_cast<double>(v_per), static_cast<double>(stall_a));
     }
 
     load_pump_range_from_nvs_or_defaults(s_pump_min_rad_s, s_pump_max_rad_s);
     ESP_LOGI(TAG, "pump range loaded: duty 0-100%% -> %.1f..%.1f rad/s",
-        (double)s_pump_min_rad_s, (double)s_pump_max_rad_s);
+        static_cast<double>(s_pump_min_rad_s), static_cast<double>(s_pump_max_rad_s));
 
     static WiFiManager wifi(nv, wifi_event_handler, nullptr);
     ESP_LOGI(TAG, "wifi manager started; if unprovisioned, use ESP-Touch v2 app");
@@ -557,7 +565,7 @@ extern "C" void app_main(void) {
 
     // Nothing left to do in app_main. The motor task drives commutation on
     // core 1, the webserver workers handle requests, we just block forever.
-    while (1) {
+    while (true) {
         vTaskDelay(portMAX_DELAY);
     }
 }
