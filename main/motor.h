@@ -73,6 +73,7 @@ class Motor {
 
     void  setup_mcpwm();
     void  run();
+    void  set_gate(bool on);   // drive the bridge enable / gate-driver pin
     void  write_duties(float da, float db, float dc);
     void  ident_apply_voltage_bc(float vbc);
     float fast_sin(float angle_rad) const;

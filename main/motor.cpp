@@ -1,10 +1,12 @@
 #include "motor.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <numbers>
 #include <optional>
+#include <utility>
 
 #include "current_sense.h"
 
@@ -40,6 +42,10 @@ constexpr float VBUS_VOLTS      = static_cast<float>(CONFIG_MOTOR_VBUS_VOLTS);
 constexpr float TWO_PI        = 2.0f * std::numbers::pi_v<float>;
 constexpr float TWO_PI_OVER_3 = TWO_PI / 3.0f;
 
+constexpr float SQRT3         = std::numbers::sqrt3_v<float>;
+constexpr float INV_SQRT3     = std::numbers::inv_sqrt3_v<float>;
+constexpr float SQRT3_OVER_2  = SQRT3 / 2.0f;
+
 // On enable we hold angle=0 and velocity=0 for this many ticks at the
 // computed align_vamp_ so the rotor parks at the commanded electrical
 // angle. Without this, starting from an arbitrary rotor position usually
@@ -63,11 +69,9 @@ constexpr float STALL_ARM_VELOCITY_RAD_S = 200.0f;
 // magnitude jitter caused by bias offsets without losing real overcurrent.
 constexpr float I_MAG_EMA_ALPHA = 0.005f;
 
-float clampf(float x, float lo, float hi) {
-    if (x < lo) return lo;
-    if (x > hi) return hi;
-    return x;
-}
+// Fraction of the final value an RC/RL step reaches after one time constant:
+// i(τ) = i_final · (1 − 1/e). Used to extract τ from the L-step response.
+constexpr float ONE_TIME_CONSTANT_FRACTION = 1.0f - 1.0f / std::numbers::e_v<float>;
 
 // Clarke transform → magnitude of the current vector in stator frame. For
 // balanced 3-phase sinusoids this equals the peak phase current. Used by
@@ -75,9 +79,24 @@ float clampf(float x, float lo, float hi) {
 // enable) is important for the magnitude to be meaningful.
 float compute_i_mag(float ia, float ib) {
     float i_alpha = ia;
-    float i_beta  = (ia + 2.0f * ib) * 0.5773502691f;   // 1/sqrt(3)
+    float i_beta  = (ia + 2.0f * ib) * INV_SQRT3;
     return std::sqrt(i_alpha * i_alpha + i_beta * i_beta);
 }
+
+// Minimal scope guard: runs the supplied callable on scope exit. Lets
+// identify() declare its bridge-teardown (gate off + clear the ident flag)
+// once and have it run on every return path, success or error.
+template <typename F>
+class ScopeExit {
+ public:
+    explicit ScopeExit(F f) : f_(std::move(f)) {}
+    ~ScopeExit() { f_(); }
+    ScopeExit(const ScopeExit &) = delete;
+    ScopeExit &operator=(const ScopeExit &) = delete;
+
+ private:
+    F f_;
+};
 
 }  // namespace
 
@@ -94,6 +113,10 @@ void Motor::write_duties(float da, float db, float dc) {
     mcpwm_comparator_set_compare_value(cmp_[0], static_cast<uint32_t>(da * PWM_PEAK_TICKS));
     mcpwm_comparator_set_compare_value(cmp_[1], static_cast<uint32_t>(db * PWM_PEAK_TICKS));
     mcpwm_comparator_set_compare_value(cmp_[2], static_cast<uint32_t>(dc * PWM_PEAK_TICKS));
+}
+
+void Motor::set_gate(bool on) {
+    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), on ? 1 : 0);
 }
 
 bool IRAM_ATTR Motor::on_pwm_peak(mcpwm_timer_handle_t,
@@ -261,7 +284,7 @@ void Motor::run() {
             std::fabs(current_velocity) > STALL_ARM_VELOCITY_RAD_S) {
             if (i_mag_filtered > stall_threshold) {
                 if (++stall_count > STALL_DURATION_TICKS) {
-                    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
+                    set_gate(false);
                     enabled_.store(false, std::memory_order_relaxed);
                     stalled_.store(true, std::memory_order_relaxed);
                     ESP_LOGE(TAG, "stall: |I|=%.2f A > %.2f A for >%d ms — disabling",
@@ -294,14 +317,14 @@ void Motor::run() {
                 float v_per = v_per_rad_s_.load(std::memory_order_relaxed);
                 vamp = v_off + v_per * std::fabs(current_velocity);
             }
-            vamp = clampf(vamp, 0.0f, MAX_VOLTAGE_AMP);
+            vamp = std::clamp(vamp, 0.0f, MAX_VOLTAGE_AMP);
 
             float amp = vamp / VBUS_VOLTS;
             // 3rd-harmonic injection: common-mode signal that does not appear
             // in the line-to-line voltage the motor sees, but flattens the
             // per-phase waveform so we can run with a higher fundamental
             // amplitude (up to ~0.577 of Vbus) without clipping the duty.
-            amp = clampf(amp, 0.0f, 0.55f);
+            amp = std::clamp(amp, 0.0f, 0.55f);
             float third = (1.0f / 6.0f) * fast_sin(3.0f * angle);
 
             float da = 0.5f + amp * (fast_sin(angle)                 + third);
@@ -356,7 +379,7 @@ esp_err_t Motor::init() {
     enable_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     enable_cfg.intr_type = GPIO_INTR_DISABLE;
     ESP_ERROR_CHECK(gpio_config(&enable_cfg));
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
+    set_gate(false);
 
     write_duties(0.5f, 0.5f, 0.5f);
 
@@ -379,37 +402,33 @@ void Motor::enable() {
     // to have accurate readings.
     current_sense_.calibrate_bias();
     stalled_.store(false);
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 1);
+    set_gate(true);
     enabled_.store(true);
     ESP_LOGI(TAG, "enabled");
 }
 
 void Motor::disable() {
     enabled_.store(false);
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
+    set_gate(false);
     ESP_LOGI(TAG, "disabled");
 }
 
 void Motor::set_velocity(float rad_per_sec) {
-    float v = clampf(rad_per_sec, -MAX_VELOCITY, MAX_VELOCITY);
-    target_velocity_rad_s_.store(v);
+    target_velocity_rad_s_.store(std::clamp(rad_per_sec, -MAX_VELOCITY, MAX_VELOCITY));
 }
 
 void Motor::set_voltage_amplitude(float volts) {
-    float v = clampf(volts, 0.0f, MAX_VOLTAGE_AMP);
-    v_offset_v_.store(v);
+    v_offset_v_.store(std::clamp(volts, 0.0f, MAX_VOLTAGE_AMP));
 }
 
 void Motor::set_v_per_rad_s(float v_per_rad_s) {
-    if (v_per_rad_s < 0.0f) v_per_rad_s = 0.0f;
-    v_per_rad_s_.store(v_per_rad_s);
+    v_per_rad_s_.store(std::max(v_per_rad_s, 0.0f));
 }
 
 void Motor::set_stall_current_a(float amps) {
-    // Floor at a sensible minimum; setting it too low (< noise floor) would
-    // make the detector trip on idle bias jitter. Zero means "disabled".
-    if (amps < 0.0f) amps = 0.0f;
-    stall_current_a_.store(amps);
+    // Floor at zero; setting it too low (< noise floor) would make the detector
+    // trip on idle bias jitter. Zero means "disabled".
+    stall_current_a_.store(std::max(amps, 0.0f));
 }
 
 Motor::Status Motor::status() const {
@@ -432,7 +451,7 @@ void Motor::set_cal(const Cal &cal) {
     if (!cal.valid) return;
     cal_ = cal;
     // Align voltage solves: V_LL = sqrt(3) * vamp = V_dead + 2*Rs*I_target.
-    align_vamp_ = (cal.v_dead + 2.0f * cal.rs_ohm * ALIGN_TARGET_CURRENT_A) / 1.7320508075f;
+    align_vamp_ = (cal.v_dead + 2.0f * cal.rs_ohm * ALIGN_TARGET_CURRENT_A) / SQRT3;
     ESP_LOGI(TAG, "cal applied: Rs=%.4f Ω, Ls=%.6f H, V_dead=%.4f V, align_vamp=%.4f V",
         static_cast<double>(cal.rs_ohm), static_cast<double>(cal.ls_henry),
         static_cast<double>(cal.v_dead), static_cast<double>(align_vamp_));
@@ -446,12 +465,10 @@ Motor::Cal Motor::cal() const {
 // Used during identification to apply known DC voltages. Line-to-line BC
 // voltage = sqrt(3) * vamp, so amp = vbc / (sqrt(3) * Vbus).
 void Motor::ident_apply_voltage_bc(float vbc) {
-    float amp = vbc / (1.7320508075f * VBUS_VOLTS);
-    if (amp < 0.0f) amp = 0.0f;
-    if (amp > 0.30f) amp = 0.30f;   // safety cap inside ID
+    float amp = std::clamp(vbc / (SQRT3 * VBUS_VOLTS), 0.0f, 0.30f);   // 0.30 = safety cap inside ID
     float da = 0.5f;
-    float db = 0.5f - 0.8660254f * amp;
-    float dc = 0.5f + 0.8660254f * amp;
+    float db = 0.5f - SQRT3_OVER_2 * amp;
+    float dc = 0.5f + SQRT3_OVER_2 * amp;
     write_duties(da, db, dc);
 }
 
@@ -467,13 +484,21 @@ std::optional<Motor::Cal> Motor::identify() {
     ident_in_progress_.store(true, std::memory_order_release);
     vTaskDelay(pdMS_TO_TICKS(5));
 
+    // Bridge teardown for every exit path below: cut the gate and hand the
+    // bridge back to the motor task. Declared once here so no early-return
+    // error case can forget either step.
+    ScopeExit teardown([this] {
+        set_gate(false);
+        ident_in_progress_.store(false, std::memory_order_release);
+    });
+
     // Re-zero the current sensor with the gate still off — the INA240+shunt
     // drifts with temperature, so a fresh zero matches the current thermal
     // state of the board.
     current_sense_.calibrate_bias();
 
     // Enable the gate driver.
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 1);
+    set_gate(true);
 
     // --- Rs measurement (adaptive) ---
     //
@@ -516,8 +541,6 @@ std::optional<Motor::Cal> Motor::identify() {
     }
     if (!v_found) {
         ident_apply_voltage_bc(0.0f);
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify: could not find a usable Rs probe voltage "
                       "(last V=%.4f, I=%.4f) — check wiring and current sensor",
             static_cast<double>(v_disc), static_cast<double>(i_disc));
@@ -526,7 +549,8 @@ std::optional<Motor::Cal> Motor::identify() {
 
     // Five ascending probes 1.0×..1.4× of v_disc.
     const std::array<float, 5> scale = {1.0f, 1.1f, 1.2f, 1.3f, 1.4f};
-    float v_pts[5], i_pts[5];
+    std::array<float, 5> v_pts{};
+    std::array<float, 5> i_pts{};
     int n_valid = 0;
     for (int i = 0; i < 5; i++) {
         float v_probe = v_disc * scale[i];
@@ -544,8 +568,6 @@ std::optional<Motor::Cal> Motor::identify() {
     vTaskDelay(pdMS_TO_TICKS(30));
 
     if (n_valid < 3) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify Rs: only %d valid probes — can't fit", n_valid);
         return std::nullopt;
     }
@@ -560,8 +582,6 @@ std::optional<Motor::Cal> Motor::identify() {
     }
     float denom = n_valid * sum_ii - sum_i * sum_i;
     if (std::fabs(denom) < 1e-9f) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify Rs: degenerate probe data");
         return std::nullopt;
     }
@@ -572,8 +592,6 @@ std::optional<Motor::Cal> Motor::identify() {
         n_valid, static_cast<double>(r_loop), static_cast<double>(v_dead));
 
     if (r_loop <= 0.0f) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify Rs: negative slope — wiring or sensor issue");
         return std::nullopt;
     }
@@ -610,19 +628,15 @@ std::optional<Motor::Cal> Motor::identify() {
     for (int i = n_samples - 20; i < n_samples; i++) i_final += samples[i];
     i_final /= 20.0f;
     if (i_final < 0.01f) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify L: final current %.4f A too low", static_cast<double>(i_final));
         return std::nullopt;
     }
-    float i_thresh = 0.6321f * i_final;
+    float i_thresh = ONE_TIME_CONSTANT_FRACTION * i_final;
     int idx_tau = -1;
     for (int i = 0; i < n_samples; i++) {
         if (samples[i] >= i_thresh) { idx_tau = i; break; }
     }
     if (idx_tau <= 0) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify L: could not extract τ from step response");
         return std::nullopt;
     }
@@ -633,8 +647,7 @@ std::optional<Motor::Cal> Motor::identify() {
         static_cast<double>(i_final), idx_tau, static_cast<double>(tau_s * 1000.0f),
         static_cast<double>(l_loop));
 
-    // Release the bridge.
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
+    // Leave the bridge in a neutral state; the teardown guard cuts the gate.
     write_duties(0.5f, 0.5f, 0.5f);
 
     Cal result;
@@ -643,7 +656,6 @@ std::optional<Motor::Cal> Motor::identify() {
     result.ls_henry = ls;
     result.v_dead   = v_dead;
     set_cal(result);
-    ident_in_progress_.store(false, std::memory_order_release);
 
     ESP_LOGI(TAG, "identify ok: Rs=%.4f Ω, Ls=%.6f H, V_dead=%.4f V",
         static_cast<double>(rs), static_cast<double>(ls), static_cast<double>(v_dead));

@@ -1,6 +1,7 @@
 #include "MotorWebServer.h"
 
 #include <algorithm>
+#include <array>
 #include <numbers>
 #include <optional>
 #include <string>
@@ -38,6 +39,13 @@ void cal_to_json(const Motor::Cal &cal, JsonWrapper &json) {
     }
 }
 
+// Serialize a JSON body and send it as the 200 response.
+esp_err_t send_json(httpd_req_t *req, const JsonWrapper &json) {
+    httpd_resp_set_type(req, "application/json");
+    std::string out = json.ToString();
+    return httpd_resp_sendstr(req, out.c_str());
+}
+
 }  // namespace
 
 MotorWebServer::MotorWebServer(WebContext *ctx, Motor &motor, CurrentSense &current_sense,
@@ -55,8 +63,7 @@ float MotorWebServer::elec_to_mech_rpm(float elec_rad_s) const {
 }
 
 float MotorWebServer::pump_duty_to_velocity(float duty) const {
-    if (duty < 0.0f)   duty = 0.0f;
-    if (duty > 100.0f) duty = 100.0f;
+    duty = std::clamp(duty, 0.0f, 100.0f);
     return pump_min_rad_s_ + (duty / 100.0f) * (pump_max_rad_s_ - pump_min_rad_s_);
 }
 
@@ -87,62 +94,36 @@ esp_err_t MotorWebServer::start() {
     esp_err_t r = WebServer::start();
     if (r != ESP_OK) return r;
 
-    httpd_uri_t motor_post = {
-        .uri = "/motor",
-        .method = HTTP_POST,
-        .handler = motor_post_handler,
-        .user_ctx = this,
+    struct Route {
+        const char    *uri;
+        httpd_method_t method;
+        esp_err_t (*handler)(httpd_req_t *);
     };
-    httpd_register_uri_handler(server, &motor_post);
+    // /pump and /pump_range are compatible with stillerate's RESTMotorController.
+    const std::array<Route, 7> routes = {{
+        {"/motor",      HTTP_POST, motor_post_handler},
+        {"/motor",      HTTP_GET,  motor_get_handler},
+        {"/calibrate",  HTTP_POST, calibrate_post_handler},
+        {"/calibrate",  HTTP_GET,  calibrate_get_handler},
+        {"/pump",       HTTP_POST, pump_post_handler},
+        {"/pump_range", HTTP_POST, pump_range_post_handler},
+        {"/pump_range", HTTP_GET,  pump_range_get_handler},
+    }};
 
-    httpd_uri_t motor_get = {
-        .uri = "/motor",
-        .method = HTTP_GET,
-        .handler = motor_get_handler,
-        .user_ctx = this,
-    };
-    httpd_register_uri_handler(server, &motor_get);
-
-    httpd_uri_t cal_post = {
-        .uri = "/calibrate",
-        .method = HTTP_POST,
-        .handler = calibrate_post_handler,
-        .user_ctx = this,
-    };
-    httpd_register_uri_handler(server, &cal_post);
-
-    httpd_uri_t cal_get = {
-        .uri = "/calibrate",
-        .method = HTTP_GET,
-        .handler = calibrate_get_handler,
-        .user_ctx = this,
-    };
-    httpd_register_uri_handler(server, &cal_get);
-
-    // Compatible with stillerate's RESTMotorController: POST {"duty":0-100}.
-    httpd_uri_t pump_post = {
-        .uri = "/pump",
-        .method = HTTP_POST,
-        .handler = pump_post_handler,
-        .user_ctx = this,
-    };
-    httpd_register_uri_handler(server, &pump_post);
-
-    httpd_uri_t pump_range_post = {
-        .uri = "/pump_range",
-        .method = HTTP_POST,
-        .handler = pump_range_post_handler,
-        .user_ctx = this,
-    };
-    httpd_register_uri_handler(server, &pump_range_post);
-
-    httpd_uri_t pump_range_get = {
-        .uri = "/pump_range",
-        .method = HTTP_GET,
-        .handler = pump_range_get_handler,
-        .user_ctx = this,
-    };
-    httpd_register_uri_handler(server, &pump_range_get);
+    for (const Route &route : routes) {
+        httpd_uri_t uri = {
+            .uri      = route.uri,
+            .method   = route.method,
+            .handler  = route.handler,
+            .user_ctx = this,
+        };
+        esp_err_t err = httpd_register_uri_handler(server, &uri);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "failed to register %s %s: %s",
+                route.method == HTTP_POST ? "POST" : "GET", route.uri, esp_err_to_name(err));
+            return err;
+        }
+    }
 
     return ESP_OK;
 }
@@ -198,20 +179,14 @@ esp_err_t MotorWebServer::motor_post_handler(httpd_req_t *req) {
 
     JsonWrapper resp;
     self->status_to_json(resp);
-    httpd_resp_set_type(req, "application/json");
-    std::string out = resp.ToString();
-    httpd_resp_sendstr(req, out.c_str());
-    return ESP_OK;
+    return send_json(req, resp);
 }
 
 esp_err_t MotorWebServer::motor_get_handler(httpd_req_t *req) {
     MotorWebServer *self = static_cast<MotorWebServer *>(req->user_ctx);
     JsonWrapper resp;
     self->status_to_json(resp);
-    httpd_resp_set_type(req, "application/json");
-    std::string out = resp.ToString();
-    httpd_resp_sendstr(req, out.c_str());
-    return ESP_OK;
+    return send_json(req, resp);
 }
 
 esp_err_t MotorWebServer::calibrate_post_handler(httpd_req_t *req) {
@@ -233,10 +208,7 @@ esp_err_t MotorWebServer::calibrate_post_handler(httpd_req_t *req) {
 
     JsonWrapper resp;
     cal_to_json(cal, resp);
-    httpd_resp_set_type(req, "application/json");
-    std::string out = resp.ToString();
-    httpd_resp_sendstr(req, out.c_str());
-    return ESP_OK;
+    return send_json(req, resp);
 }
 
 esp_err_t MotorWebServer::calibrate_get_handler(httpd_req_t *req) {
@@ -244,10 +216,7 @@ esp_err_t MotorWebServer::calibrate_get_handler(httpd_req_t *req) {
     Motor::Cal cal = self->motor_.cal();
     JsonWrapper resp;
     cal_to_json(cal, resp);
-    httpd_resp_set_type(req, "application/json");
-    std::string out = resp.ToString();
-    httpd_resp_sendstr(req, out.c_str());
-    return ESP_OK;
+    return send_json(req, resp);
 }
 
 // POST /pump {"duty":0-100[,"name":"..."]} — speed control compatible with
@@ -296,10 +265,7 @@ esp_err_t MotorWebServer::pump_post_handler(httpd_req_t *req) {
     resp.AddItem("received_duty",  static_cast<int>(duty + 0.5f));
     resp.AddItem("velocity_rad_s", velocity);
     resp.AddItem("enabled",        enabled);
-    httpd_resp_set_type(req, "application/json");
-    std::string out = resp.ToString();
-    httpd_resp_sendstr(req, out.c_str());
-    return ESP_OK;
+    return send_json(req, resp);
 }
 
 // POST /pump_range {"min_rad_s":N,"max_rad_s":N} — set the duty→velocity
@@ -337,10 +303,7 @@ esp_err_t MotorWebServer::pump_range_post_handler(httpd_req_t *req) {
     JsonWrapper resp;
     resp.AddItem("min_rad_s", self->pump_min_rad_s_);
     resp.AddItem("max_rad_s", self->pump_max_rad_s_);
-    httpd_resp_set_type(req, "application/json");
-    std::string out = resp.ToString();
-    httpd_resp_sendstr(req, out.c_str());
-    return ESP_OK;
+    return send_json(req, resp);
 }
 
 esp_err_t MotorWebServer::pump_range_get_handler(httpd_req_t *req) {
@@ -348,8 +311,5 @@ esp_err_t MotorWebServer::pump_range_get_handler(httpd_req_t *req) {
     JsonWrapper resp;
     resp.AddItem("min_rad_s", self->pump_min_rad_s_);
     resp.AddItem("max_rad_s", self->pump_max_rad_s_);
-    httpd_resp_set_type(req, "application/json");
-    std::string out = resp.ToString();
-    httpd_resp_sendstr(req, out.c_str());
-    return ESP_OK;
+    return send_json(req, resp);
 }
