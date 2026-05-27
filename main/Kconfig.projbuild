@@ -1,0 +1,67 @@
+menu "Pump Controller Configuration"
+
+    menu "Motor pins (IR2104 wiring)"
+
+        config MOTOR_PWM_A_GPIO
+            int "Phase A PWM GPIO -> IR2104 #1 IN"
+            range 0 39
+            default 16
+            help
+                GPIO connected to the IN pin of the IR2104 driving phase A.
+                Confirmed by oscilloscope on board bring-up.
+
+        config MOTOR_PWM_B_GPIO
+            int "Phase B PWM GPIO -> IR2104 #2 IN"
+            range 0 39
+            default 5
+
+        config MOTOR_PWM_C_GPIO
+            int "Phase C PWM GPIO -> IR2104 #3 IN"
+            range 0 39
+            default 17
+
+        config MOTOR_ENABLE_GPIO
+            int "Common enable GPIO -> all IR2104 SD# pins"
+            range 0 39
+            default 4
+            help
+                Single GPIO tied to all three IR2104 SD# (active-high) pins.
+                Verified by continuity check on this board.
+
+    endmenu
+
+    menu "Motor limits"
+
+        config MOTOR_VBUS_VOLTS
+            int "DC bus voltage (volts)"
+            range 6 30
+            default 12
+
+        config MOTOR_MAX_VELOCITY_RAD_S
+            int "Max commanded electrical velocity (rad/s)"
+            range 1 5000
+            default 2000
+
+        config MOTOR_MAX_VOLTAGE_X10
+            int "Max commanded voltage amplitude (volts x 10)"
+            range 1 100
+            default 60
+            help
+                Stored as volts*10 because Kconfig has no float type.
+                Default 60 = 6.0 V. With 3rd-harmonic injection and a 12 V bus,
+                the modulation can deliver up to ~6.9 V phase amplitude before
+                clipping. Set this near that ceiling and let the per-step
+                voltage in main.c stay much lower for normal running.
+
+        config MOTOR_SLEW_RAD_S2_X10
+            int "Velocity slew rate (rad/s^2 x 10)"
+            range 1 100000
+            default 1000
+            help
+                Maximum rate of change of the velocity setpoint.
+                Default 5000 = 500.0 rad/s^2. Drone motors want to spend as little
+                time as possible at low electrical speed, so accelerate aggressively.
+
+    endmenu
+
+endmenu

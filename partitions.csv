@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Single-app layout for 4MB flash. nvs and phy_init keep the same auto offsets
+# (0x9000 / 0xf000) and sizes as the built-in partitions_singleapp.csv, so
+# stored NVS data (wifi creds, hostname, motor cal, tuning) survives a flash.
+# Only the app partition is enlarged: 1M -> 3M, using the previously-unused
+# flash. Was 98% full; the build warning goes away.
+nvs,      data, nvs,     ,        0x6000,
+phy_init, data, phy,     ,        0x1000,
+factory,  app,  factory, ,        0x300000,

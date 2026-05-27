@@ -1,0 +1,100 @@
+dependencies:
+  button:
+    component_hash: b4591caffa3193bfa0e3b4918d0e336f25d3422e32ac20b3cf85ff15b43617b9
+    dependencies: []
+    source:
+      git: git@github.com:mianos/mianesp.git
+      path: components/button
+      type: git
+    version: 72237bccf5436bea7e8583b7130a0c389979e70d
+  espressif/cjson:
+    component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.19~2
+  espressif/network_provisioning:
+    component_hash: 72d27784e3daf807418a34fb00be136ec50c6db49d989ce981d22e031fc0e7f8
+    dependencies:
+    - name: espressif/cjson
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >= 6.0
+      version: ^1.7.19
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.4
+  idf:
+    source:
+      type: idf
+    version: 6.0.1
+  jsonwrapper:
+    component_hash: d97d0444ba00923463c63ec6056b6271559d52675c503ea24613a0ff4fbc9dae
+    dependencies:
+    - name: espressif/cjson
+      version: '*'
+    source:
+      git: git@github.com:mianos/mianesp.git
+      path: components/jsonwrapper
+      type: git
+    version: 72237bccf5436bea7e8583b7130a0c389979e70d
+  nvsstoragemanager:
+    component_hash: cef848bc7e88b7a257c369d448b0c1026e37d006703c384db9f1b7a4ef67ffae
+    dependencies: []
+    source:
+      git: git@github.com:mianos/mianesp.git
+      path: components/nvsstoragemanager
+      type: git
+    version: 72237bccf5436bea7e8583b7130a0c389979e70d
+  webserver:
+    component_hash: 61f578f6a54f2ce6004f321e4fba80bd2b2973683f4b409e05472bb7a8567c71
+    dependencies:
+    - git: git@github.com:mianos/mianesp.git
+      name: wifimanager
+      path: components/wifimanager
+      version: idf6-network-provisioning
+    - git: git@github.com:mianos/mianesp.git
+      name: jsonwrapper
+      path: components/jsonwrapper
+      version: idf6-network-provisioning
+    - git: git@github.com:mianos/mianesp.git
+      name: nvsstoragemanager
+      path: components/nvsstoragemanager
+      version: idf6-network-provisioning
+    - git: git@github.com:mianos/mianesp.git
+      name: button
+      path: components/button
+      version: idf6-network-provisioning
+    source:
+      git: https://github.com/mianos/mianesp.git
+      path: components/webserver
+      type: git
+    version: 72237bccf5436bea7e8583b7130a0c389979e70d
+  wifimanager:
+    component_hash: 123ed2037583a70e9c793a5f7684764f56bc9bb2346415ffd4bc5bab0941d8e0
+    dependencies:
+    - name: espressif/network_provisioning
+      version: ^1.1.0
+    source:
+      git: git@github.com:mianos/mianesp.git
+      path: components/wifimanager
+      type: git
+    version: 72237bccf5436bea7e8583b7130a0c389979e70d
+direct_dependencies:
+- button
+- jsonwrapper
+- nvsstoragemanager
+- webserver
+- wifimanager
+manifest_hash: 0f144c2aaadea0d527a96871c997b0719a43179452c151da7058efb1d10b58ae
+target: esp32
+version: 3.0.0
