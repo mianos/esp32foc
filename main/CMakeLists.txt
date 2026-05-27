@@ -6,6 +6,9 @@ idf_component_register(
         "main.cpp"
         "motor.cpp"
         "current_sense.cpp"
+        "Settings.cpp"
+        "WifiConnection.cpp"
+        "MotorWebServer.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         esp_driver_gpio
