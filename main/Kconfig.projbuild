@@ -58,9 +58,13 @@ menu "Pump Controller Configuration"
             range 1 100000
             default 1000
             help
-                Maximum rate of change of the velocity setpoint.
-                Default 5000 = 500.0 rad/s^2. Drone motors want to spend as little
-                time as possible at low electrical speed, so accelerate aggressively.
+                Maximum rate of change of the commanded electrical velocity.
+                Default 1000 = 100.0 rad/s^2 — deliberately gentle for an open-loop
+                V/Hz pump: ramp the field faster than the loaded rotor can accelerate
+                and it pulls out of sync (and a pull-out below STALL_ARM_VELOCITY
+                won't be caught). Centrifugal load rises with speed, so size for the
+                high-speed end. Raise it (e.g. 1500-2500) if spin-up is too sluggish
+                and the rotor still tracks cleanly under real pumping load.
 
     endmenu
 

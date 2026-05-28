@@ -76,6 +76,7 @@ void MotorWebServer::status_to_json(JsonWrapper &json) {
     json.AddItem("voltage_v",              st.voltage_amplitude_v);
     json.AddItem("v_offset_v",             st.v_offset_v);
     json.AddItem("v_per_rad_s",            st.v_per_rad_s);
+    json.AddItem("slew_rad_s2",            st.slew_rad_s2);
     json.AddItem("i_mag_a",                st.i_mag_a);
     json.AddItem("i_bus_est_a",            st.i_bus_est_a);
     json.AddItem("stall_current_a",        st.stall_current_a);
@@ -156,6 +157,11 @@ esp_err_t MotorWebServer::motor_post_handler(httpd_req_t *req) {
     if (json.GetField("stall_current_a", v)) {
         self->motor_.set_stall_current_a(v);
         tuning_changed = true;
+    }
+    // slew_rad_s2 has its own NVS key; save the clamped effective value.
+    if (json.GetField("slew_rad_s2", v)) {
+        self->motor_.set_slew_rad_s2(v);
+        self->settings_.save_slew(self->motor_.status().slew_rad_s2);
     }
     // pole_pairs only scales the RPM readout; persist it on its own NVS key
     // (independent of the V/Hz tuning group) so it survives a reboot.

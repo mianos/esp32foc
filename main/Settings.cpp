@@ -60,6 +60,16 @@ bool Settings::save_vhz(float v_offset, float v_per_rad_s, float stall_a) {
     return ok;
 }
 
+bool Settings::load_slew(float &slew_rad_s2) const {
+    std::string s;
+    if (retrieve("slew_rads2", s) && !s.empty()) return parse_float(s, slew_rad_s2);
+    return false;
+}
+
+bool Settings::save_slew(float slew_rad_s2) {
+    return store("slew_rads2", std::to_string(slew_rad_s2));
+}
+
 void Settings::load_pump_range(float &min_rad_s, float &max_rad_s) const {
     min_rad_s = kDefaultPumpMinRadS;
     max_rad_s = kDefaultPumpMaxRadS;

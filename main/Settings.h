@@ -22,6 +22,11 @@ public:
     void load_vhz(float &v_offset, float &v_per_rad_s, float &stall_a) const;
     bool save_vhz(float v_offset, float v_per_rad_s, float stall_a);
 
+    // Velocity slew rate (rad/s^2). Returns false if unset, leaving `slew`
+    // untouched so the caller keeps the compile-time (Kconfig) default.
+    bool load_slew(float &slew_rad_s2) const;
+    bool save_slew(float slew_rad_s2);
+
     // Pump duty->velocity mapping range. Missing keys fall back to defaults.
     void load_pump_range(float &min_rad_s, float &max_rad_s) const;
     bool save_pump_range(float min_rad_s, float max_rad_s);

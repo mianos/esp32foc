@@ -9,6 +9,18 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000
 
+# Velocity slew = 100 rad/s^2: gentle open-loop ramp for the pump (avoids
+# rotor pull-out under centrifugal load). Tune up if spin-up is too slow.
+CONFIG_MOTOR_SLEW_RAD_S2_X10=1000
+
+# Keep the carrier-peak ISR (Motor::on_pwm_peak) and the compare-write it calls
+# alive during flash-cache-off windows (NVS writes, OTA). Without CACHE_SAFE the
+# MCPWM interrupt is masked while the cache is disabled; without CTRL_FUNC_IN_IRAM
+# mcpwm_comparator_set_compare_value lives in flash and would fault. Together they
+# let the ISR keep commutating regardless of WiFi/web/flash activity.
+CONFIG_MCPWM_ISR_CACHE_SAFE=y
+CONFIG_MCPWM_CTRL_FUNC_IN_IRAM=y
+
 CONFIG_MQTT_PROTOCOL_5=y
 CONFIG_MQTT_TRANSPORT_SSL=y
 
