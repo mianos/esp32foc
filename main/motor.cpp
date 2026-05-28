@@ -1,10 +1,12 @@
 #include "motor.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <numbers>
 #include <optional>
+#include <utility>
 
 #include "current_sense.h"
 
@@ -38,7 +40,21 @@ constexpr float SLEW_RAD_S2     = CONFIG_MOTOR_SLEW_RAD_S2_X10 / 10.0f;
 constexpr float VBUS_VOLTS      = static_cast<float>(CONFIG_MOTOR_VBUS_VOLTS);
 
 constexpr float TWO_PI        = 2.0f * std::numbers::pi_v<float>;
-constexpr float TWO_PI_OVER_3 = TWO_PI / 3.0f;
+
+constexpr float SQRT3         = std::numbers::sqrt3_v<float>;
+constexpr float INV_SQRT3     = std::numbers::inv_sqrt3_v<float>;
+constexpr float SQRT3_OVER_2  = SQRT3 / 2.0f;
+
+// Fixed-point commutation (ISR side). The phase accumulator is uint32 spanning
+// a full electrical revolution, so a 120° offset is exactly 2^32/3.
+constexpr uint32_t PHASE_OFFSET_120 = 0x55555555u;   // +120° (2^32/3)
+constexpr uint32_t PHASE_OFFSET_240 = 0xAAAAAAAAu;   // +240° (2·2^32/3)
+// 3rd-harmonic injection gain (1/6) in Q15: 32768/6 ≈ 5461.
+constexpr int32_t  THIRD_HARMONIC_GAIN_Q15 = 5461;
+// Q15 scale and the amplitude headroom that keeps the injected waveform
+// (peak ≈ √3/2 of the fundamental) from clipping the duty.
+constexpr float    Q15_SCALE   = 32768.0f;
+constexpr float    MAX_MOD_AMP = 0.55f;
 
 // On enable we hold angle=0 and velocity=0 for this many ticks at the
 // computed align_vamp_ so the rotor parks at the commanded electrical
@@ -63,11 +79,9 @@ constexpr float STALL_ARM_VELOCITY_RAD_S = 200.0f;
 // magnitude jitter caused by bias offsets without losing real overcurrent.
 constexpr float I_MAG_EMA_ALPHA = 0.005f;
 
-float clampf(float x, float lo, float hi) {
-    if (x < lo) return lo;
-    if (x > hi) return hi;
-    return x;
-}
+// Fraction of the final value an RC/RL step reaches after one time constant:
+// i(τ) = i_final · (1 − 1/e). Used to extract τ from the L-step response.
+constexpr float ONE_TIME_CONSTANT_FRACTION = 1.0f - 1.0f / std::numbers::e_v<float>;
 
 // Clarke transform → magnitude of the current vector in stator frame. For
 // balanced 3-phase sinusoids this equals the peak phase current. Used by
@@ -75,20 +89,28 @@ float clampf(float x, float lo, float hi) {
 // enable) is important for the magnitude to be meaningful.
 float compute_i_mag(float ia, float ib) {
     float i_alpha = ia;
-    float i_beta  = (ia + 2.0f * ib) * 0.5773502691f;   // 1/sqrt(3)
+    float i_beta  = (ia + 2.0f * ib) * INV_SQRT3;
     return std::sqrt(i_alpha * i_alpha + i_beta * i_beta);
 }
+
+// Minimal scope guard: runs the supplied callable on scope exit. Lets
+// identify() declare its bridge-teardown (gate off + clear the ident flag)
+// once and have it run on every return path, success or error.
+template <typename F>
+class ScopeExit {
+ public:
+    explicit ScopeExit(F f) : f_(std::move(f)) {}
+    ~ScopeExit() { f_(); }
+    ScopeExit(const ScopeExit &) = delete;
+    ScopeExit &operator=(const ScopeExit &) = delete;
+
+ private:
+    F f_;
+};
 
 }  // namespace
 
 Motor::Motor(CurrentSense &current_sense) : current_sense_(current_sense) {}
-
-float Motor::fast_sin(float angle_rad) const {
-    while (angle_rad < 0.0f)    angle_rad += TWO_PI;
-    while (angle_rad >= TWO_PI) angle_rad -= TWO_PI;
-    int idx = static_cast<int>(angle_rad * (kSinLutSize / TWO_PI));
-    return sin_lut_[idx & (kSinLutSize - 1)];
-}
 
 void Motor::write_duties(float da, float db, float dc) {
     mcpwm_comparator_set_compare_value(cmp_[0], static_cast<uint32_t>(da * PWM_PEAK_TICKS));
@@ -96,15 +118,105 @@ void Motor::write_duties(float da, float db, float dc) {
     mcpwm_comparator_set_compare_value(cmp_[2], static_cast<uint32_t>(dc * PWM_PEAK_TICKS));
 }
 
+// IRAM: write three pre-clamped compare values. Called from the carrier ISR, so
+// it must stay resident with the cache off (mcpwm_comparator_set_compare_value is
+// in IRAM via CONFIG_MCPWM_CTRL_FUNC_IN_IRAM).
+void IRAM_ATTR Motor::write_duties_ticks(uint32_t a, uint32_t b, uint32_t c) {
+    mcpwm_comparator_set_compare_value(cmp_[0], a);
+    mcpwm_comparator_set_compare_value(cmp_[1], b);
+    mcpwm_comparator_set_compare_value(cmp_[2], c);
+}
+
+// IRAM, integer-only (no FPU — unsafe in an ISR on ESP32). Produces the compare
+// value for one phase: wave = sin(θ) + (1/6)·sin(3θ) in Q15, scaled by the Q15
+// amplitude and centred at 50% duty. Intermediates widened to int32/int64 so the
+// multiply can't overflow; result clamped to [0, PWM_PEAK_TICKS] because
+// mcpwm_comparator_set_compare_value silently rejects an out-of-range value.
+uint32_t IRAM_ATTR Motor::phase_duty_ticks(uint32_t phase, int32_t amp_q) const {
+    static_assert(kSinLutSize == 256, "phase>>24 index assumes a 256-entry LUT");
+    uint32_t idx  = (phase >> 24) & (kSinLutSize - 1);
+    uint32_t idx3 = ((phase * 3u) >> 24) & (kSinLutSize - 1);
+    int32_t  s    = sin_lut_q15_[idx];
+    int32_t  s3   = sin_lut_q15_[idx3];
+    int32_t  wave = s + ((s3 * THIRD_HARMONIC_GAIN_Q15) >> 15);   // Q15, peak ~38230 > int16
+    int32_t  scaled = static_cast<int32_t>((static_cast<int64_t>(amp_q) * wave) >> 15);
+    int32_t  cmp  = PWM_HALF_DUTY + ((scaled * PWM_PEAK_TICKS) >> 15);
+    if (cmp < 0)              cmp = 0;
+    if (cmp > PWM_PEAK_TICKS) cmp = PWM_PEAK_TICKS;
+    return static_cast<uint32_t>(cmp);
+}
+
+void Motor::set_gate(bool on) {
+    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), on ? 1 : 0);
+}
+
+// Task-side float→fixed conversion of the commutation command. Float math is
+// fine here (task context); the ISR only ever reads the integer results.
+void Motor::publish_commutation(float velocity_rad_s, float amp_volts) {
+    // DDS increment: electrical revolutions per control tick mapped onto the full
+    // uint32 phase span. tick rate follows the decimation. Compute in double and
+    // truncate to uint32 — the low-32-bit wrap is exactly the phase wrap, and it
+    // stays correct (and signed for reverse rotation) at any velocity.
+    double tick_rate_hz = 20000.0 / static_cast<double>(
+        commutation_decimation_.load(std::memory_order_relaxed));
+    double rev_per_tick = static_cast<double>(velocity_rad_s) /
+                          (2.0 * std::numbers::pi_v<double> * tick_rate_hz);
+    int64_t inc = llrint(rev_per_tick * 4294967296.0);   // × 2^32
+    phase_inc_.store(static_cast<uint32_t>(inc), std::memory_order_relaxed);
+
+    // Q15 modulation amplitude, clamped to the 3rd-harmonic headroom.
+    float amp = std::clamp(amp_volts / VBUS_VOLTS, 0.0f, MAX_MOD_AMP);
+    amp_q_.store(static_cast<int32_t>(lrintf(amp * Q15_SCALE)), std::memory_order_relaxed);
+}
+
+// Carrier-peak ISR — now the commutation engine. Runs in IRAM and (with
+// CONFIG_MCPWM_ISR_CACHE_SAFE) keeps firing while the flash cache is disabled, so
+// the field keeps rotating regardless of WiFi/web/flash activity on either core.
+// Integer-only: float in an ISR is UB on ESP32 (the FPU isn't saved across
+// interrupts). The task publishes phase_inc_/amp_q_; here we just integrate the
+// angle and emit duties — if the task stalls, the last published rate holds.
 bool IRAM_ATTR Motor::on_pwm_peak(mcpwm_timer_handle_t,
                                   const mcpwm_timer_event_data_t *,
                                   void *user_ctx) {
     Motor *self = static_cast<Motor *>(user_ctx);
     BaseType_t hpw = pdFALSE;
-    if (++self->isr_decim_ >= self->commutation_decimation_.load(std::memory_order_relaxed)) {
-        self->isr_decim_ = 0;
-        xSemaphoreGiveFromISR(self->tick_sem_, &hpw);
+
+    // Decimate the 20 kHz carrier to the commutation tick rate.
+    if (++self->isr_decim_ < self->commutation_decimation_.load(std::memory_order_relaxed)) {
+        return false;
     }
+    self->isr_decim_ = 0;
+
+    // identify() drives the bridge from the task (other core). Release the bridge,
+    // acknowledge so identify() can start without a dual-core compare-write race,
+    // and still wake the task for diagnostics.
+    if (self->ident_in_progress_.load(std::memory_order_acquire)) {
+        self->isr_idle_for_ident_.store(true, std::memory_order_release);
+        xSemaphoreGiveFromISR(self->tick_sem_, &hpw);
+        return hpw == pdTRUE;
+    }
+
+    if (self->isr_enabled_.load(std::memory_order_relaxed)) {
+        // Park the phase at 0 on the enable edge (the task bumps the epoch).
+        uint32_t epoch = self->phase_epoch_.load(std::memory_order_acquire);
+        if (epoch != self->isr_last_epoch_) {
+            self->isr_phase_      = 0;
+            self->isr_last_epoch_ = epoch;
+        }
+        self->isr_phase_ += self->phase_inc_.load(std::memory_order_relaxed);
+        int32_t  amp_q = self->amp_q_.load(std::memory_order_relaxed);
+        uint32_t ph    = self->isr_phase_;
+        self->write_duties_ticks(self->phase_duty_ticks(ph,                    amp_q),
+                                 self->phase_duty_ticks(ph + PHASE_OFFSET_120, amp_q),
+                                 self->phase_duty_ticks(ph + PHASE_OFFSET_240, amp_q));
+    } else {
+        // Bridge idle: 50% on all three → no winding differential.
+        self->write_duties_ticks(PWM_HALF_DUTY, PWM_HALF_DUTY, PWM_HALF_DUTY);
+        self->isr_phase_ = 0;
+    }
+
+    // Wake the task for ADC sampling / slew / stall detection (best-effort).
+    xSemaphoreGiveFromISR(self->tick_sem_, &hpw);
     return hpw == pdTRUE;
 }
 
@@ -172,9 +284,9 @@ void Motor::task_main(void *arg) {
 
 void Motor::run() {
     float dt = COMMUTATION_PERIOD_MS / 1000.0f;
-    float slew_per_step = SLEW_RAD_S2 * dt;
 
-    float angle = 0.0f;
+    // The electrical angle now lives in the carrier ISR (isr_phase_); the task
+    // only commands rate + amplitude. It keeps the velocity slew here.
     float current_velocity = 0.0f;
     uint32_t tick_count = 0;
     bool prev_enabled = false;
@@ -201,22 +313,25 @@ void Motor::run() {
             continue;
         }
 
-        // identify() may have changed the decimation; recompute timestep
-        // and slew step so wall-clock semantics stay correct.
+        // identify() may have changed the decimation; recompute the timestep so
+        // wall-clock semantics stay correct.
         uint32_t decim = commutation_decimation_.load(std::memory_order_relaxed);
         if (decim != prev_decim) {
             dt = decim * (1.0f / 20000.0f);
-            slew_per_step = SLEW_RAD_S2 * dt;
             prev_decim = decim;
         }
 
+        // Per-tick so a runtime slew change (POST /motor) takes effect immediately.
+        float slew_per_step = slew_rad_s2_.load(std::memory_order_relaxed) * dt;
+
         bool enabled = enabled_.load(std::memory_order_relaxed);
 
-        // Enable edge: start alignment phase. Rotor parks at angle 0.
+        // Enable edge: start alignment phase. Bump the epoch so the ISR parks
+        // the electrical angle at 0 (it holds there while phase_inc stays 0).
         if (enabled && !prev_enabled) {
             align_remaining = ALIGN_TICKS;
-            angle = 0.0f;
             current_velocity = 0.0f;
+            phase_epoch_.fetch_add(1, std::memory_order_release);
         }
         prev_enabled = enabled;
 
@@ -261,8 +376,11 @@ void Motor::run() {
             std::fabs(current_velocity) > STALL_ARM_VELOCITY_RAD_S) {
             if (i_mag_filtered > stall_threshold) {
                 if (++stall_count > STALL_DURATION_TICKS) {
-                    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
+                    set_gate(false);
                     enabled_.store(false, std::memory_order_relaxed);
+                    isr_enabled_.store(false, std::memory_order_relaxed);
+                    phase_inc_.store(0, std::memory_order_relaxed);
+                    amp_q_.store(0, std::memory_order_relaxed);
                     stalled_.store(true, std::memory_order_relaxed);
                     ESP_LOGE(TAG, "stall: |I|=%.2f A > %.2f A for >%d ms — disabling",
                         static_cast<double>(i_mag_filtered), static_cast<double>(stall_threshold),
@@ -279,10 +397,6 @@ void Motor::run() {
 
         float vamp;
         if (enabled) {
-            angle += current_velocity * dt;
-            if (angle >= TWO_PI) angle -= TWO_PI;
-            if (angle < 0.0f)    angle += TWO_PI;
-
             // V/Hz mapping. During ALIGN use a cal-derived voltage that
             // produces a known parking current independent of the user's
             // v_offset (which may be tuned for spinning operation and would
@@ -294,26 +408,18 @@ void Motor::run() {
                 float v_per = v_per_rad_s_.load(std::memory_order_relaxed);
                 vamp = v_off + v_per * std::fabs(current_velocity);
             }
-            vamp = clampf(vamp, 0.0f, MAX_VOLTAGE_AMP);
+            vamp = std::clamp(vamp, 0.0f, MAX_VOLTAGE_AMP);
 
-            float amp = vamp / VBUS_VOLTS;
-            // 3rd-harmonic injection: common-mode signal that does not appear
-            // in the line-to-line voltage the motor sees, but flattens the
-            // per-phase waveform so we can run with a higher fundamental
-            // amplitude (up to ~0.577 of Vbus) without clipping the duty.
-            amp = clampf(amp, 0.0f, 0.55f);
-            float third = (1.0f / 6.0f) * fast_sin(3.0f * angle);
-
-            float da = 0.5f + amp * (fast_sin(angle)                 + third);
-            float db = 0.5f + amp * (fast_sin(angle - TWO_PI_OVER_3) + third);
-            float dc = 0.5f + amp * (fast_sin(angle + TWO_PI_OVER_3) + third);
-            write_duties(da, db, dc);
+            // Hand the rate + amplitude to the carrier ISR. The ISR does the
+            // 3rd-harmonic-injected 3-phase synthesis (in integer Q15) and the
+            // compare writes; if this task stalls, the ISR keeps rotating the
+            // field at the last published rate.
+            publish_commutation(current_velocity, vamp);
         } else {
-            // Bridge idle: all three at 50% means no winding differential.
+            // Bridge idle. isr_enabled_ is already false (set by disable()/stall),
+            // so the ISR holds all three phases at 50% — no winding differential.
             vamp = 0.0f;
-            angle = 0.0f;
             current_velocity = 0.0f;
-            write_duties(0.5f, 0.5f, 0.5f);
         }
         voltage_amplitude_v_.store(vamp, std::memory_order_relaxed);
 
@@ -324,8 +430,12 @@ void Motor::run() {
 
 esp_err_t Motor::init() {
     for (int i = 0; i < kSinLutSize; i++) {
-        sin_lut_[i] = std::sin(TWO_PI * static_cast<float>(i) / static_cast<float>(kSinLutSize));
+        float s = std::sin(TWO_PI * static_cast<float>(i) / static_cast<float>(kSinLutSize));
+        sin_lut_q15_[i] = static_cast<int16_t>(std::lrintf(s * 32767.0f));   // Q15
     }
+
+    // Compile-time default; NVS / POST /motor may override at runtime.
+    slew_rad_s2_.store(SLEW_RAD_S2, std::memory_order_relaxed);
 
     tick_sem_ = xSemaphoreCreateBinary();
     if (!tick_sem_) {
@@ -356,7 +466,7 @@ esp_err_t Motor::init() {
     enable_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     enable_cfg.intr_type = GPIO_INTR_DISABLE;
     ESP_ERROR_CHECK(gpio_config(&enable_cfg));
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
+    set_gate(false);
 
     write_duties(0.5f, 0.5f, 0.5f);
 
@@ -379,37 +489,67 @@ void Motor::enable() {
     // to have accurate readings.
     current_sense_.calibrate_bias();
     stalled_.store(false);
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 1);
+    set_gate(true);
+    // Hand commutation to the ISR. phase_inc_/amp_q_ are 0 (cleared at disable),
+    // so the field stays parked until run() detects the edge and publishes the
+    // alignment command — no stale rate leaks in during the handoff.
+    isr_enabled_.store(true, std::memory_order_relaxed);
     enabled_.store(true);
     ESP_LOGI(TAG, "enabled");
 }
 
 void Motor::disable() {
+    // Soft stop: ramp the commanded velocity to 0 before cutting the gate.
+    // Abruptly tristate-ing the bridge with a spinning rotor lets the
+    // back-EMF freewheel through body diodes and emits a switching transient
+    // that couples noise into nearby signals (e.g. the debug UART). Waiting
+    // for the task's existing slew loop to bring current_velocity to ~0 means
+    // the rotor is at rest against the static field by the time the gate
+    // drops — no transient, no noise. Bounded so a stuck velocity can't keep
+    // the gate live forever; stall trip in run() bypasses this and cuts now.
+    if (enabled_.load()) {
+        target_velocity_rad_s_.store(0.0f);
+        const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+        while (std::fabs(current_velocity_rad_s_.load()) > 1.0f &&
+               xTaskGetTickCount() < deadline) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        float v_left = current_velocity_rad_s_.load();
+        if (std::fabs(v_left) > 1.0f) {
+            ESP_LOGW(TAG, "soft-stop timed out at %.1f rad/s; cutting gate hard",
+                static_cast<double>(v_left));
+        }
+    }
     enabled_.store(false);
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
+    isr_enabled_.store(false, std::memory_order_relaxed);
+    phase_inc_.store(0, std::memory_order_relaxed);
+    amp_q_.store(0, std::memory_order_relaxed);
+    set_gate(false);
     ESP_LOGI(TAG, "disabled");
 }
 
 void Motor::set_velocity(float rad_per_sec) {
-    float v = clampf(rad_per_sec, -MAX_VELOCITY, MAX_VELOCITY);
-    target_velocity_rad_s_.store(v);
+    target_velocity_rad_s_.store(std::clamp(rad_per_sec, -MAX_VELOCITY, MAX_VELOCITY));
 }
 
 void Motor::set_voltage_amplitude(float volts) {
-    float v = clampf(volts, 0.0f, MAX_VOLTAGE_AMP);
-    v_offset_v_.store(v);
+    v_offset_v_.store(std::clamp(volts, 0.0f, MAX_VOLTAGE_AMP));
 }
 
 void Motor::set_v_per_rad_s(float v_per_rad_s) {
-    if (v_per_rad_s < 0.0f) v_per_rad_s = 0.0f;
-    v_per_rad_s_.store(v_per_rad_s);
+    v_per_rad_s_.store(std::max(v_per_rad_s, 0.0f));
 }
 
 void Motor::set_stall_current_a(float amps) {
-    // Floor at a sensible minimum; setting it too low (< noise floor) would
-    // make the detector trip on idle bias jitter. Zero means "disabled".
-    if (amps < 0.0f) amps = 0.0f;
-    stall_current_a_.store(amps);
+    // Floor at zero; setting it too low (< noise floor) would make the detector
+    // trip on idle bias jitter. Zero means "disabled".
+    stall_current_a_.store(std::max(amps, 0.0f));
+}
+
+void Motor::set_slew_rad_s2(float rad_s2) {
+    // Clamp to the Kconfig range (1..100000 ×10 ⇒ 0.1..10000 rad/s²). A floor
+    // keeps the ramp moving; too-high invites open-loop pull-out (user's risk).
+    slew_rad_s2_.store(std::clamp(rad_s2, 1.0f, 10000.0f));
 }
 
 Motor::Status Motor::status() const {
@@ -419,6 +559,7 @@ Motor::Status Motor::status() const {
     out.voltage_amplitude_v    = voltage_amplitude_v_.load();
     out.v_offset_v             = v_offset_v_.load();
     out.v_per_rad_s            = v_per_rad_s_.load();
+    out.slew_rad_s2            = slew_rad_s2_.load();
     out.i_mag_a                = i_mag_filtered_a_.load();
     out.i_bus_est_a            = i_bus_est_a_.load();
     out.stall_current_a        = stall_current_a_.load();
@@ -432,7 +573,7 @@ void Motor::set_cal(const Cal &cal) {
     if (!cal.valid) return;
     cal_ = cal;
     // Align voltage solves: V_LL = sqrt(3) * vamp = V_dead + 2*Rs*I_target.
-    align_vamp_ = (cal.v_dead + 2.0f * cal.rs_ohm * ALIGN_TARGET_CURRENT_A) / 1.7320508075f;
+    align_vamp_ = (cal.v_dead + 2.0f * cal.rs_ohm * ALIGN_TARGET_CURRENT_A) / SQRT3;
     ESP_LOGI(TAG, "cal applied: Rs=%.4f Ω, Ls=%.6f H, V_dead=%.4f V, align_vamp=%.4f V",
         static_cast<double>(cal.rs_ohm), static_cast<double>(cal.ls_henry),
         static_cast<double>(cal.v_dead), static_cast<double>(align_vamp_));
@@ -446,12 +587,10 @@ Motor::Cal Motor::cal() const {
 // Used during identification to apply known DC voltages. Line-to-line BC
 // voltage = sqrt(3) * vamp, so amp = vbc / (sqrt(3) * Vbus).
 void Motor::ident_apply_voltage_bc(float vbc) {
-    float amp = vbc / (1.7320508075f * VBUS_VOLTS);
-    if (amp < 0.0f) amp = 0.0f;
-    if (amp > 0.30f) amp = 0.30f;   // safety cap inside ID
+    float amp = std::clamp(vbc / (SQRT3 * VBUS_VOLTS), 0.0f, 0.30f);   // 0.30 = safety cap inside ID
     float da = 0.5f;
-    float db = 0.5f - 0.8660254f * amp;
-    float dc = 0.5f + 0.8660254f * amp;
+    float db = 0.5f - SQRT3_OVER_2 * amp;
+    float dc = 0.5f + SQRT3_OVER_2 * amp;
     write_duties(da, db, dc);
 }
 
@@ -463,9 +602,30 @@ std::optional<Motor::Cal> Motor::identify() {
 
     ESP_LOGI(TAG, "identify start");
 
-    // Take the bridge from the motor task and give it a tick to bail.
+    // Take the bridge from both the motor task and the carrier ISR. The 5 ms
+    // delay lets the task bail; the ISR runs on the other core and never blocks,
+    // so it acks via isr_idle_for_ident_ once it has stopped writing compares.
+    // Wait for that ack before we drive the compares ourselves — otherwise both
+    // cores write the same comparator registers (a data race).
+    isr_idle_for_ident_.store(false, std::memory_order_relaxed);
     ident_in_progress_.store(true, std::memory_order_release);
     vTaskDelay(pdMS_TO_TICKS(5));
+    bool isr_released = false;
+    for (int i = 0; i < 50; i++) {
+        if (isr_idle_for_ident_.load(std::memory_order_acquire)) { isr_released = true; break; }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (!isr_released) {
+        ESP_LOGW(TAG, "identify: carrier ISR did not ack bridge release; proceeding");
+    }
+
+    // Bridge teardown for every exit path below: cut the gate and hand the
+    // bridge back to the motor task. Declared once here so no early-return
+    // error case can forget either step.
+    ScopeExit teardown([this] {
+        set_gate(false);
+        ident_in_progress_.store(false, std::memory_order_release);
+    });
 
     // Re-zero the current sensor with the gate still off — the INA240+shunt
     // drifts with temperature, so a fresh zero matches the current thermal
@@ -473,7 +633,7 @@ std::optional<Motor::Cal> Motor::identify() {
     current_sense_.calibrate_bias();
 
     // Enable the gate driver.
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 1);
+    set_gate(true);
 
     // --- Rs measurement (adaptive) ---
     //
@@ -516,8 +676,6 @@ std::optional<Motor::Cal> Motor::identify() {
     }
     if (!v_found) {
         ident_apply_voltage_bc(0.0f);
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify: could not find a usable Rs probe voltage "
                       "(last V=%.4f, I=%.4f) — check wiring and current sensor",
             static_cast<double>(v_disc), static_cast<double>(i_disc));
@@ -526,7 +684,8 @@ std::optional<Motor::Cal> Motor::identify() {
 
     // Five ascending probes 1.0×..1.4× of v_disc.
     const std::array<float, 5> scale = {1.0f, 1.1f, 1.2f, 1.3f, 1.4f};
-    float v_pts[5], i_pts[5];
+    std::array<float, 5> v_pts{};
+    std::array<float, 5> i_pts{};
     int n_valid = 0;
     for (int i = 0; i < 5; i++) {
         float v_probe = v_disc * scale[i];
@@ -544,8 +703,6 @@ std::optional<Motor::Cal> Motor::identify() {
     vTaskDelay(pdMS_TO_TICKS(30));
 
     if (n_valid < 3) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify Rs: only %d valid probes — can't fit", n_valid);
         return std::nullopt;
     }
@@ -560,8 +717,6 @@ std::optional<Motor::Cal> Motor::identify() {
     }
     float denom = n_valid * sum_ii - sum_i * sum_i;
     if (std::fabs(denom) < 1e-9f) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify Rs: degenerate probe data");
         return std::nullopt;
     }
@@ -572,8 +727,6 @@ std::optional<Motor::Cal> Motor::identify() {
         n_valid, static_cast<double>(r_loop), static_cast<double>(v_dead));
 
     if (r_loop <= 0.0f) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify Rs: negative slope — wiring or sensor issue");
         return std::nullopt;
     }
@@ -610,19 +763,15 @@ std::optional<Motor::Cal> Motor::identify() {
     for (int i = n_samples - 20; i < n_samples; i++) i_final += samples[i];
     i_final /= 20.0f;
     if (i_final < 0.01f) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify L: final current %.4f A too low", static_cast<double>(i_final));
         return std::nullopt;
     }
-    float i_thresh = 0.6321f * i_final;
+    float i_thresh = ONE_TIME_CONSTANT_FRACTION * i_final;
     int idx_tau = -1;
     for (int i = 0; i < n_samples; i++) {
         if (samples[i] >= i_thresh) { idx_tau = i; break; }
     }
     if (idx_tau <= 0) {
-        gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
-        ident_in_progress_.store(false, std::memory_order_release);
         ESP_LOGE(TAG, "identify L: could not extract τ from step response");
         return std::nullopt;
     }
@@ -633,8 +782,7 @@ std::optional<Motor::Cal> Motor::identify() {
         static_cast<double>(i_final), idx_tau, static_cast<double>(tau_s * 1000.0f),
         static_cast<double>(l_loop));
 
-    // Release the bridge.
-    gpio_set_level(static_cast<gpio_num_t>(CONFIG_MOTOR_ENABLE_GPIO), 0);
+    // Leave the bridge in a neutral state; the teardown guard cuts the gate.
     write_duties(0.5f, 0.5f, 0.5f);
 
     Cal result;
@@ -643,7 +791,6 @@ std::optional<Motor::Cal> Motor::identify() {
     result.ls_henry = ls;
     result.v_dead   = v_dead;
     set_cal(result);
-    ident_in_progress_.store(false, std::memory_order_release);
 
     ESP_LOGI(TAG, "identify ok: Rs=%.4f Ω, Ls=%.6f H, V_dead=%.4f V",
         static_cast<double>(rs), static_cast<double>(ls), static_cast<double>(v_dead));

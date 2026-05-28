@@ -46,6 +46,13 @@ extern "C" void app_main(void) {
         motor.set_stall_current_a(stall_a);
         ESP_LOGI(TAG, "tuning loaded: v_offset=%.4f V, v_per_rad_s=%.6f V·s/rad, stall=%.2f A",
             static_cast<double>(v_offset), static_cast<double>(v_per), static_cast<double>(stall_a));
+
+        // Slew has its own key; if unset, the motor keeps the Kconfig default.
+        float slew;
+        if (settings.load_slew(slew)) {
+            motor.set_slew_rad_s2(slew);
+            ESP_LOGI(TAG, "slew loaded from NVS: %.1f rad/s^2", static_cast<double>(slew));
+        }
     }
 
     static WifiConnection wifi(settings);
@@ -61,7 +68,7 @@ extern "C" void app_main(void) {
     static MotorWebServer web(&web_ctx, motor, current_sense, settings);
     ESP_ERROR_CHECK(web.start());
     ESP_LOGI(TAG, "webserver up: POST /motor {\"velocity_rad_s\":N,\"voltage_v\":N,"
-                  "\"v_per_rad_s\":N,\"stall_current_a\":N,\"pole_pairs\":N,\"enabled\":bool}, "
+                  "\"v_per_rad_s\":N,\"stall_current_a\":N,\"slew_rad_s2\":N,\"pole_pairs\":N,\"enabled\":bool}, "
                   "GET /motor for status, POST/GET /calibrate for motor identification, "
                   "POST /pump {\"duty\":0-100}, POST/GET /pump_range "
                   "{\"min_rad_s\":N,\"max_rad_s\":N}");
