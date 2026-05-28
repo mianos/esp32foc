@@ -1,4 +1,5 @@
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -71,7 +72,15 @@ extern "C" void app_main(void) {
                   "\"v_per_rad_s\":N,\"stall_current_a\":N,\"slew_rad_s2\":N,\"pole_pairs\":N,\"enabled\":bool}, "
                   "GET /motor for status, POST/GET /calibrate for motor identification, "
                   "POST /pump {\"duty\":0-100}, POST/GET /pump_range "
-                  "{\"min_rad_s\":N,\"max_rad_s\":N}");
+                  "{\"min_rad_s\":N,\"max_rad_s\":N}, POST /firmware (raw .bin), GET /firmware");
+
+    // Confirm the running image is healthy. Until this call, the bootloader
+    // considers a fresh OTA image PENDING_VERIFY and will roll back on the
+    // next reboot — wifi, settings and the web server have all come up, so
+    // we're confident enough to cancel that rollback.
+    if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+        ESP_LOGI(TAG, "OTA: image marked valid (rollback cancelled)");
+    }
 
     // Nothing left to do in app_main. The motor task drives commutation on
     // core 1, the webserver workers handle requests, we just block forever.

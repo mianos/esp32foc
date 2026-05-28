@@ -10,10 +10,10 @@ class Motor;
 class CurrentSense;
 class Settings;
 
-// HTTP control surface for the motor: /motor, /calibrate, /pump, /pump_range
-// (plus /healthz from the WebServer base). Holds references to the drive,
-// current sensor, and settings store; the static httpd handlers recover the
-// instance from req->user_ctx. Owns the runtime pump-range and pole-pair
+// HTTP control surface for the motor: /motor, /calibrate, /pump, /pump_range,
+// /firmware (plus /healthz from the WebServer base). Holds references to the
+// drive, current sensor, and settings store; the static httpd handlers recover
+// the instance from req->user_ctx. Owns the runtime pump-range and pole-pair
 // values, loaded from Settings at construction.
 class MotorWebServer : public WebServer {
 public:
@@ -29,6 +29,8 @@ private:
     static esp_err_t pump_post_handler(httpd_req_t *req);
     static esp_err_t pump_range_post_handler(httpd_req_t *req);
     static esp_err_t pump_range_get_handler(httpd_req_t *req);
+    static esp_err_t firmware_post_handler(httpd_req_t *req);
+    static esp_err_t firmware_get_handler(httpd_req_t *req);
 
     void  status_to_json(JsonWrapper &json);
     float elec_to_mech_rpm(float elec_rad_s) const;

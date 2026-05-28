@@ -2,11 +2,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <numbers>
 #include <optional>
 #include <string>
 
+#include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "Settings.h"
 #include "current_sense.h"
@@ -101,7 +106,7 @@ esp_err_t MotorWebServer::start() {
         esp_err_t (*handler)(httpd_req_t *);
     };
     // /pump and /pump_range are compatible with stillerate's RESTMotorController.
-    const std::array<Route, 7> routes = {{
+    const std::array<Route, 9> routes = {{
         {"/motor",      HTTP_POST, motor_post_handler},
         {"/motor",      HTTP_GET,  motor_get_handler},
         {"/calibrate",  HTTP_POST, calibrate_post_handler},
@@ -109,6 +114,8 @@ esp_err_t MotorWebServer::start() {
         {"/pump",       HTTP_POST, pump_post_handler},
         {"/pump_range", HTTP_POST, pump_range_post_handler},
         {"/pump_range", HTTP_GET,  pump_range_get_handler},
+        {"/firmware",   HTTP_POST, firmware_post_handler},
+        {"/firmware",   HTTP_GET,  firmware_get_handler},
     }};
 
     for (const Route &route : routes) {
@@ -317,5 +324,96 @@ esp_err_t MotorWebServer::pump_range_get_handler(httpd_req_t *req) {
     JsonWrapper resp;
     resp.AddItem("min_rad_s", self->pump_min_rad_s_);
     resp.AddItem("max_rad_s", self->pump_max_rad_s_);
+    return send_json(req, resp);
+}
+
+// POST /firmware — raw application binary (Content-Type ignored). Streams the
+// body into the inactive OTA slot, sets it as the next boot partition, and
+// reboots. Refuses while the motor is enabled (mirrors /calibrate at line
+// 198): Motor::disable() blocks until the rotor is at rest, so a false
+// `enabled` means the bridge is open and there's nothing to disturb during
+// the ~30 s of flash writes. The carrier-peak ISR is IRAM/cache-safe (see
+// sdkconfig.defaults MCPWM_* comments) so even an unrelated /pump 0 request
+// arriving mid-OTA stays harmless.
+//
+// Deploy: curl --data-binary @build/robofoc.bin http://<host>/firmware
+esp_err_t MotorWebServer::firmware_post_handler(httpd_req_t *req) {
+    MotorWebServer *self = static_cast<MotorWebServer *>(req->user_ctx);
+
+    if (self->motor_.status().enabled) {
+        return sendJsonError(req, 409, "motor must be disabled before /firmware");
+    }
+    if (req->content_len <= 0) {
+        return sendJsonError(req, 400, "Content-Length required");
+    }
+
+    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+    if (target == nullptr) {
+        return sendJsonError(req, 500, "no OTA partition available");
+    }
+    ESP_LOGI(TAG, "OTA: writing %d bytes to %s @ 0x%" PRIx32,
+        req->content_len, target->label, target->address);
+
+    esp_ota_handle_t handle = 0;
+    esp_err_t err = esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        return sendJsonError(req, 500, esp_err_to_name(err));
+    }
+
+    char buf[1024];
+    int remaining = req->content_len;
+    int written = 0;
+    while (remaining > 0) {
+        int got = httpd_req_recv(req, buf, std::min<int>(remaining, static_cast<int>(sizeof(buf))));
+        if (got == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (got <= 0) {
+            esp_ota_abort(handle);
+            ESP_LOGE(TAG, "OTA: recv failed at %d/%d (got=%d)", written, req->content_len, got);
+            return sendJsonError(req, 400, "request body truncated");
+        }
+        err = esp_ota_write(handle, buf, got);
+        if (err != ESP_OK) {
+            esp_ota_abort(handle);
+            ESP_LOGE(TAG, "esp_ota_write failed at %d: %s", written, esp_err_to_name(err));
+            return sendJsonError(req, 500, esp_err_to_name(err));
+        }
+        written   += got;
+        remaining -= got;
+    }
+
+    err = esp_ota_end(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        return sendJsonError(req, 400, esp_err_to_name(err));   // bad image / sha mismatch
+    }
+    err = esp_ota_set_boot_partition(target);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        return sendJsonError(req, 500, esp_err_to_name(err));
+    }
+
+    ESP_LOGW(TAG, "OTA: %d bytes written to %s; rebooting", written, target->label);
+    JsonWrapper resp;
+    resp.AddItem("status",    std::string("ok"));
+    resp.AddItem("written",   written);
+    resp.AddItem("partition", std::string(target->label));
+    send_json(req, resp);
+
+    // Give the TCP stack a moment to flush the response before we yank the SoC.
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;   // unreachable
+}
+
+esp_err_t MotorWebServer::firmware_get_handler(httpd_req_t *req) {
+    const esp_app_desc_t  *desc    = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    JsonWrapper resp;
+    resp.AddItem("version",   std::string(desc->version));
+    resp.AddItem("idf_ver",   std::string(desc->idf_ver));
+    resp.AddItem("date",      std::string(desc->date));
+    resp.AddItem("time",      std::string(desc->time));
+    resp.AddItem("partition", std::string(running->label));
     return send_json(req, resp);
 }
