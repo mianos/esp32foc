@@ -27,3 +27,9 @@ CONFIG_MQTT_TRANSPORT_SSL=y
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# OTA rollback: a new image boots into PENDING_VERIFY. main.cpp calls
+# esp_ota_mark_app_valid_cancel_rollback() after the web server starts; if
+# we never get that far (panic, wifi failure, etc.) the bootloader reverts
+# to the previous slot on the next reboot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
